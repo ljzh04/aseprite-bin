@@ -1,4 +1,4 @@
-
+# .github/workflows/aseprite.yml
 name: aseprite
 
 on:
@@ -7,25 +7,115 @@ on:
       version:
         description: "Version to build, leave empty for latest"
         required: false
+        default: ''
 
 jobs:
   build:
     runs-on: windows-2022
     steps:
-
-      - name: Checkout
+      - name: Checkout local repository
         uses: actions/checkout@v4
 
-      - name: Build
+      - name: Determine Versions
+        id: versions
+        shell: pwsh
+        run: |
+          # If a version is passed as input, use it. Otherwise, fetch the latest.
+          $asepriteVersion = "${{ github.event.inputs.version }}"
+          if ([string]::IsNullOrEmpty($asepriteVersion)) {
+            try {
+              Write-Host "Fetching latest Aseprite release version..."
+              $apiUrl = "https://api.github.com/repos/aseprite/aseprite/releases/latest"
+              $response = Invoke-RestMethod -Uri $apiUrl -Headers @{ "Accept" = "application/vnd.github.v3+json" }
+              $asepriteVersion = $response.tag_name
+            } catch {
+              Write-Error "Failed to fetch latest Aseprite version from GitHub API."
+              exit 1
+            }
+          }
+
+          # Determine Skia version based on Aseprite version
+          if ($asepriteVersion -like '*beta*') {
+            $skiaVersion = "m124-08a5439a6b"
+          } else {
+            $skiaVersion = "m102-861e4743af"
+          }
+          
+          Write-Host "Aseprite Version: $asepriteVersion"
+          Write-Host "Skia Version: $skiaVersion"
+          
+          # Set outputs for other steps
+          echo "ASEPRITE_VERSION=$asepriteVersion" >> $env:GITHUB_OUTPUT
+          echo "SKIA_VERSION=$skiaVersion" >> $env:GITHUB_OUTPUT
+
+      - name: Cache and Setup Ninja
+        id: cache-ninja
+        uses: actions/cache@v4
+        with:
+          path: ninja
+          key: ninja-1.11.0-win
+
+      - name: Download Ninja
+        if: steps.cache-ninja.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ninjaUrl = "https://github.com/ninja-build/ninja/releases/download/v1.11.0/ninja-win.zip"
+          Invoke-WebRequest -Uri $ninjaUrl -OutFile ninja.zip
+          Expand-Archive -Path ninja.zip -DestinationPath ninja -Force
+          Remove-Item ninja.zip
+      
+      - name: Add Ninja to PATH
+        shell: pwsh
+        run: echo "$env:GITHUB_WORKSPACE\ninja" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Cache and Setup Skia
+        id: cache-skia
+        uses: actions/cache@v4
+        with:
+          path: skia-${{ steps.versions.outputs.SKIA_VERSION }}
+          key: ${{ runner.os }}-skia-${{ steps.versions.outputs.SKIA_VERSION }}
+      
+      - name: Download Skia
+        if: steps.cache-skia.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $skiaVersion = "${{ steps.versions.outputs.SKIA_VERSION }}"
+          $skiaUrl = "https://github.com/aseprite/skia/releases/download/$skiaVersion/Skia-Windows-Release-x64.zip"
+          $skiaDir = "skia-$skiaVersion"
+
+          Write-Host "Downloading Skia from $skiaUrl"
+          Invoke-WebRequest -Uri $skiaUrl -OutFile Skia.zip
+          Expand-Archive -Path Skia.zip -DestinationPath $skiaDir -Force
+          Remove-Item Skia.zip
+
+      - name: Setup Ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ runner.os }}-ccache-${{ steps.versions.outputs.ASEPRITE_VERSION }}
+          # Restore from other versions as well for shared files
+          restore-keys: |
+            ${{ runner.os }}-ccache-
+
+      - name: Checkout Aseprite Source Code
+        uses: actions/checkout@v4
+        with:
+          repository: aseprite/aseprite
+          ref: ${{ steps.versions.outputs.ASEPRITE_VERSION }}
+          path: aseprite
+          submodules: 'recursive'
+          # depth: 1 # depth: 1 can sometimes interfere with version detection, full clone is more robust
+          
+      - name: Build Aseprite
         id: build
         shell: cmd
-        run: call build.cmd
-        env:
-          ASEPRITE_VERSION: ${{ github.event.inputs.version }}
-
-      - name: Archive
+        run: |
+          set ASEPRITE_VERSION=${{ steps.versions.outputs.ASEPRITE_VERSION }}
+          set SKIA_VERSION=${{ steps.versions.outputs.SKIA_VERSION }}
+          call build.ps1
+        
+      - name: Archive Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: aseprite-${{ steps.build.outputs.ASEPRITE_VERSION }}
-          path: github
+          name: aseprite-${{ steps.versions.outputs.ASEPRITE_VERSION }}
+          path: output
           if-no-files-found: error
